@@ -8,29 +8,18 @@ Run locally with:
 Deploy publicly on Streamlit Community Cloud:
     1. Push this folder (app.py, requirements.txt, packages.txt) to a GitHub repo
     2. Go to https://share.streamlit.io -> New app -> point at your repo
-    3. Streamlit Cloud reads packages.txt to apt-install minimap2 automatically
-
-Note: this version deliberately avoids pysam. pysam is a compiled C-extension
-(wraps htslib) and is only tested/supported up to Python 3.13 - Streamlit
-Community Cloud has been intermittently forcing new deployments onto Python
-3.14, which crashes pysam silently (segfault, no traceback). Since all we
-actually need is a linear scan through minimap2's alignments (no BAM
-sorting/random-access indexing required for this use case), we parse
-minimap2's plain-text SAM output directly in pure Python instead. This also
-means samtools is no longer a dependency at all.
+    3. Streamlit Cloud reads packages.txt to apt-install minimap2 + samtools automatically
 """
 
 import os
-import re
 import subprocess
 import tempfile
 
 import numpy as np
 import pandas as pd
+import pysam
 import streamlit as st
 from scipy.stats import binom
-import matplotlib
-matplotlib.use("Agg")  # non-interactive backend - required for headless servers
 import matplotlib.pyplot as plt
 
 # =====================================================================
@@ -157,124 +146,50 @@ def get_amino_acid_presence(aligned_pairs, ref_seq, query_seq, cdr_start0, cdr_e
 
 
 # =====================================================================
-# PURE-PYTHON REPLACEMENTS FOR PYSAM (no compiled C-extension dependency)
-# =====================================================================
-CIGAR_RE = re.compile(r'(\d+)([MIDNSHP=X])')
-
-
-def sam_to_aligned_pairs(pos_1based, cigar_str):
-    """
-    Pure-Python equivalent of pysam's read.get_aligned_pairs(with_seq=False).
-    Returns a list of (query_pos, ref_pos) tuples, 0-based, matching pysam's
-    convention: soft/hard clips excluded entirely, insertions as
-    (query_pos, None), deletions as (None, ref_pos), matches/mismatches as
-    (query_pos, ref_pos).
-    """
-    query_pos = 0
-    ref_pos = pos_1based - 1
-    pairs = []
-    for length_str, op in CIGAR_RE.findall(cigar_str):
-        length = int(length_str)
-        if op in ("M", "=", "X"):
-            for _ in range(length):
-                pairs.append((query_pos, ref_pos))
-                query_pos += 1
-                ref_pos += 1
-        elif op == "I":
-            for _ in range(length):
-                pairs.append((query_pos, None))
-                query_pos += 1
-        elif op in ("D", "N"):
-            for _ in range(length):
-                pairs.append((None, ref_pos))
-                ref_pos += 1
-        elif op == "S":
-            query_pos += length  # soft clip: consumes query, excluded from pairs
-        # H and P consume neither query nor reference - nothing to do
-    return pairs
-
-
-def sam_reference_length(cigar_str):
-    """Total reference span covered by this alignment (sum of M/D/N/=/X ops)."""
-    total = 0
-    for length_str, op in CIGAR_RE.findall(cigar_str):
-        if op in ("M", "D", "N", "=", "X"):
-            total += int(length_str)
-    return total
-
-
-def parse_sam_lines(sam_text):
-    """
-    Parse minimap2's SAM text output into a list of alignment dicts:
-    {name, flag, pos, cigar, seq, is_unmapped, is_secondary, is_supplementary}
-    Skips header lines (starting with '@').
-    """
-    records = []
-    for line in sam_text.splitlines():
-        if not line or line.startswith("@"):
-            continue
-        fields = line.split("\t")
-        if len(fields) < 11:
-            continue
-        qname, flag_str, rname, pos_str, mapq, cigar = fields[0], fields[1], fields[2], fields[3], fields[4], fields[5]
-        seq = fields[9]
-        flag = int(flag_str)
-        records.append({
-            "name": qname,
-            "flag": flag,
-            "pos": int(pos_str),
-            "cigar": cigar,
-            "seq": seq,
-            "is_unmapped": bool(flag & 4),
-            "is_secondary": bool(flag & 256),
-            "is_supplementary": bool(flag & 2048),
-        })
-    return records
-
-
-# =====================================================================
 # PIPELINE: alignment + filtering (runs once, cached in session_state)
 # =====================================================================
 def run_alignment_and_filter(reference_seq, fastq_bytes, min_coverage, min_homology):
     workdir = tempfile.mkdtemp()
     ref_fasta = os.path.join(workdir, "reference.fasta")
     fastq_path = os.path.join(workdir, "sample.fastq")
+    bam_path = os.path.join(workdir, "mapped_sorted.bam")
 
-    ref_seq = reference_seq.strip().upper()
     with open(ref_fasta, "w") as f:
         f.write(">reference\n")
-        f.write(ref_seq + "\n")
+        f.write(reference_seq.strip().upper() + "\n")
+    pysam.faidx(ref_fasta)
 
     with open(fastq_path, "wb") as f:
         f.write(fastq_bytes)
 
-    # minimap2 writes SAM directly to stdout - no samtools sort/index needed,
-    # since we only need a single linear pass through the alignments.
-    align_cmd = ["minimap2", "-ax", "map-ont", ref_fasta, fastq_path]
-    result = subprocess.run(align_cmd, capture_output=True, text=True)
+    align_cmd = f"minimap2 -ax map-ont {ref_fasta} {fastq_path} | samtools sort -o {bam_path} -"
+    result = subprocess.run(align_cmd, shell=True, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"Alignment failed:\n{result.stderr}")
+    pysam.index(bam_path)
 
-    sam_records = parse_sam_lines(result.stdout)
-    ref_len = len(ref_seq)
+    samfile = pysam.AlignmentFile(bam_path, "rb")
+    fastafile = pysam.FastaFile(ref_fasta)
+    ref_name = samfile.references[0]
+    ref_len = int(samfile.lengths[0])
+    ref_seq = fastafile.fetch(ref_name).upper()
 
     passed_reads = []  # list of dicts: {name, aligned_pairs, query_seq}
     total_processed = 0
 
-    for rec in sam_records:
-        if rec["is_unmapped"] or rec["is_secondary"] or rec["is_supplementary"]:
+    for read in samfile.fetch():
+        if read.is_unmapped or read.is_secondary or read.is_supplementary:
             continue
         total_processed += 1
-
-        aligned_len = sam_reference_length(rec["cigar"])
+        aligned_len = int(read.reference_length) if read.reference_length else 0
         if aligned_len == 0:
             continue
         coverage = aligned_len / ref_len
         if coverage < min_coverage:
             continue
 
-        aligned_pairs = sam_to_aligned_pairs(rec["pos"], rec["cigar"])
-        query_seq = rec["seq"].upper()
+        aligned_pairs = read.get_aligned_pairs(with_seq=False, matches_only=False)
+        query_seq = read.query_sequence
 
         matches = 0
         compared = 0
@@ -284,14 +199,17 @@ def run_alignment_and_filter(reference_seq, fastq_bytes, min_coverage, min_homol
             compared += 1
             if query_pos is None:
                 continue
-            if query_seq[query_pos] == ref_seq[ref_pos]:
+            if query_seq[query_pos].upper() == ref_seq[ref_pos]:
                 matches += 1
         homology = (matches / compared) if compared else 0
         if homology < min_homology:
             continue
 
-        passed_reads.append({"name": rec["name"], "aligned_pairs": aligned_pairs, "query_seq": query_seq,
+        passed_reads.append({"name": read.query_name, "aligned_pairs": aligned_pairs, "query_seq": query_seq,
                               "coverage": coverage, "homology": homology})
+
+    samfile.close()
+    fastafile.close()
 
     return {
         "ref_seq": ref_seq,
@@ -304,10 +222,10 @@ def run_alignment_and_filter(reference_seq, fastq_bytes, min_coverage, min_homol
 # =====================================================================
 # STREAMLIT UI
 # =====================================================================
-st.set_page_config(page_title="Nanopore Variant & CDR Analysis", page_icon="🎀", layout="wide")
-st.title("🎀 Nanopore Variant & CDR Analysis")
+st.set_page_config(page_title="Nanopore Variant & CDR Analysis", layout="wide")
+st.title("Nanopore Variant & CDR Analysis")
 st.caption("Upload a reference sequence and a FASTQ file, then run alignment, variant calling, "
-           "and CDR-level distribution analyses. ✨")
+           "and CDR-level distribution analyses.")
 
 with st.sidebar:
     st.header("1. Input")
