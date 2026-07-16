@@ -1,0 +1,11 @@
+[server]
+maxUploadSize = 2000
+
+[theme]
+base = "light"
+primaryColor = "#FF6FA5"
+backgroundColor = "#FFF6F9"
+secondaryBackgroundColor = "#FFE1EE"
+textColor = "#6B2C43"
+font = "sans serif"
+headingFont = "Baloo 2:https://fonts.googleapis.com/css2?family=Baloo+2:wght@600;700&display=swap"
